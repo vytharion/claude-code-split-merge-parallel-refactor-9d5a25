@@ -1,0 +1,95 @@
+## Why parallel refactor matters
+
+How does a hundred-file refactor turn into a week-long slog when each individual change takes thirty seconds? Rename a symbol. Fix the call sites. Rerun the type checker. Rinse, repeat. Each loop wakes the same caches, rebuilds the same dependency graph, and walks the same files the agent already understood ten minutes ago. The bottleneck stops being keystrokes and starts being context-switching cost on a single agent.
+
+Claude Code, the terminal-resident coding agent built on Anthropic's Claude models, has matured to the point where I can steer it as a fleet rather than a single shell. With sub-agents, git worktrees, and a disciplined split-merge protocol, one operator can fan out a refactor across several isolated working copies, let each agent specialise in one slice, and then weave the results back into the trunk branch. The pattern isn't unique to Claude Code, but the combination of long-context model behaviour, scriptable agent definitions, and first-class shell access makes it unusually clean to run.
+
+In this article I'll walk through the split-merge parallel refactor pattern end to end: how to slice work so the slices truly are independent, how to give each Claude Code agent the right blast radius, how to merge without spending the afternoon resolving conflicts, and where the pattern breaks. I'm not here to sell parallelism as a silver bullet. I want us to share a vocabulary and a small set of habits, so that the next time a refactor balloons past the size where a single agent can hold it, you know exactly what to do with the second, third, and fourth agent.
+
+## The split-merge mental model
+
+The pattern has three phases — and three out of four parallel refactor postmortems trace the failure to the same one. First you split: the refactor is decomposed into N slices that can each be completed without reading the others. Second you fan out: each slice goes to an isolated agent inside its own working copy. Third you merge: the slices come back into a single branch, ideally one at a time, with the trunk's test suite acting as the gate.
+
+The trick is the first phase. Most failed parallel refactors fail because the slices weren't actually independent. The agent in slice A renamed a function that slice B was about to call. Slice C added a new module that slice D thought already existed. The cost of fixing those collisions usually wipes out the wallclock savings.
+
+A good slice satisfies three properties. It has a clearly defined input boundary: the set of files the agent is allowed to read for context. It has a clearly defined output boundary: the set of files the agent is allowed to write. And it has a clearly defined contract with the rest of the world: function signatures, module exports, configuration keys it must preserve. If any of the three is ambiguous, the slice will leak.
+
+## Carving the refactor into independent slices
+
+Most refactor guides tell you to slice the work by directory. Three of the four strategies that actually work do something else. Layer-based slicing carves the change along architectural seams, for example splitting a refactor into a domain layer slice and an adapters layer slice. Module-based slicing assigns each top-level package to its own agent, useful when the refactor is structurally identical across packages. Feature-flag slicing routes the work through an opt-in flag, letting each agent migrate one consumer at a time. Codemod slicing reduces the change to a transformation rule and lets each agent apply the rule to a disjoint file set.
+
+Whichever strategy you pick, the slicing step must produce written artefacts. A markdown table of slice IDs, file globs, expected outputs, and contracts is enough. Without that table you won't be able to merge cleanly, because you won't be able to tell at review time whether a given hunk was supposed to be in slice A or slice B.
+
+The minimum useful slice size is roughly where a single Claude Code session can finish the work without compacting context twice. That maps to a few hundred lines of net change in most languages. Slices much smaller than that pay too much fixed cost per agent: spinning up the worktree, priming the model with project conventions, running the local test suite. Slices much larger than that defeat the purpose of splitting in the first place.
+
+## Using git worktrees as isolation walls
+
+The pragmatic isolation mechanism is the [git worktree](https://git-scm.com/docs/git-worktree) command. A worktree is a second checkout of the same repository, sharing the underlying object store but presenting its own working directory and HEAD. Two worktrees can sit on two different branches without stepping on each other's index. That's exactly what parallel agents need: a private filesystem each, but a shared history so the eventual merge is cheap.
+
+The one-time setup is small. From the trunk checkout you create one worktree per slice, each on a fresh branch named after the slice. Each worktree gets its own Claude Code session bound to its directory. Closing a worktree is a one-line command after the slice merges. No copy, no clone, no duplicated object store.
+
+Worktrees also give you a cheap rollback. If an agent goes off the rails halfway through a slice, you discard the worktree and start over without contaminating the trunk. The agent's transcript and the diff against the slice's base commit are usually enough to understand what went wrong before the second attempt.
+
+```bash
+# From the trunk checkout, prepare four slices off main.
+for slice in domain ports adapters interfaces; do
+  git worktree add "../refactor-${slice}" -b "refactor/${slice}"
+done
+
+# Launch a Claude Code session per slice in its own worktree.
+for slice in domain ports adapters interfaces; do
+  (cd "../refactor-${slice}" && \
+    claude --print "Read SLICE.md and execute the slice. \
+      Touch only files listed under 'output boundary'. \
+      Stop after tests pass locally.")
+done
+
+# After review and merge, tear the worktrees down.
+for slice in domain ports adapters interfaces; do
+  git worktree remove "../refactor-${slice}"
+done
+```
+
+## Spawning Claude Code agents per slice
+
+Each slice gets a short brief, ideally a file called SLICE.md committed to the worktree's branch before the agent starts. The brief states the slice ID, the file globs the agent may read, the file globs the agent may write, the contracts it must preserve, the local test command, and the definition of done. Claude Code is good at reading project conventions from a [CLAUDE.md](https://docs.anthropic.com/en/docs/claude-code/memory) file at the repo root, so the slice brief only needs to express what is specific to this slice rather than what is true for the whole codebase.
+
+The brief should also state what the agent is forbidden to do. Forbidding writes outside the output boundary is the single highest-leverage rule. Forbidding new dependencies is a close second. Forbidding cross-slice imports keeps the contracts honest. I don't state these as rules out of paranoia. The agent will sometimes find a tempting shortcut that looks local but actually steals work from another slice; the rule gives both the agent and the human reviewer a shared way to recognise the shortcut and reject it.
+
+For genuinely independent slices, you can let each agent run unattended and check in at intervals. For slices that share a contract surface, it's usually safer to run them one after another even though they live in separate worktrees, because the second agent can read the first agent's diff before starting. Pure parallelism is a special case of split-merge; serialised-but-isolated execution is the more common one.
+
+## Merging without breaking the build
+
+Merge order matters. Merge the slice with the most downstream consumers first, because every subsequent merge will need to acknowledge its changes anyway. Merge the slice that only adds new files last, because it's the cheapest to rebase. Between those extremes, merge slices in dependency order.
+
+Each merge should run the full test suite on the trunk branch before the next merge starts. If a slice breaks the trunk, you want to know during that slice's merge window, not three merges later when the bisect is muddied. A fast trunk test run is one of the structural prerequisites for split-merge to pay off; if the trunk suite takes an hour, the merge phase will dominate the savings the parallel phase produced.
+
+Conflict resolution at merge time should follow a single rule: never edit files outside the slice's output boundary to resolve a conflict. If the conflict is genuine, it means the slicing was wrong, and the right answer is to rebase the slice's branch on the trunk and let the agent re-emit the affected files. Hand-editing the conflict is tempting, but it tends to drop invariants the agent was tracking.
+
+## Handling cross-slice contracts
+
+The interface between slices is where the design lives. Two patterns help. The first is to extract the contract before slicing: a small commit on trunk that adds the new type signatures, the new module structure, or the new feature flag scaffold, with each slice's work then becoming the implementation behind a stable boundary. The second is to write the contract into the slice briefs verbatim, so every agent sees the same wording for the same boundary.
+
+Both patterns turn the contract into an artefact the agents can cite and the reviewer can grep for. Without that artefact, the contract lives only in the operator's head, and any drift between what slice A assumed and what slice B implemented stays invisible until integration. With the artefact, drift shows up as a textual diff against a file, which is exactly the shape Claude Code is best at noticing.
+
+## Common failure modes
+
+The first failure mode is over-slicing. Five agents on a refactor that one agent could finish in twenty minutes is pure overhead. The fixed cost of priming each agent with project conventions, of writing five slice briefs, and of running the merge gauntlet is real. Below a threshold the linear approach wins; the threshold is closer to several hundred lines of net change than to several thousand.
+
+The second failure mode is leaky slices. The agent writes outside its output boundary because the work happens to require it and the brief didn't anticipate the case. The fix is procedural: review the diff for boundary violations before the merge, and treat a violation as a re-slice signal rather than a fix-up signal. If the agent had to leak, the slicing was wrong.
+
+The third failure mode is silent contract drift. Two agents reach merge time agreeing on the function name but disagreeing on the argument order. The type checker catches it; the test suite catches it; but the reviewer's mental model is now wrong because both agents reported success. The fix is to put the contract in writing before slicing and to make each agent cite it in their final summary.
+
+The fourth failure mode is merge fatigue. The parallel phase finishes in an hour and the merge phase takes a day, because the trunk suite is slow, the conflicts are real, and the reviewer is alone. This is a process problem, not a Claude Code problem, but it's the single most common reason split-merge feels like it didn't pay off. Investing in a fast trunk suite is the highest-leverage thing you can do before adopting the pattern broadly.
+
+## When NOT to split-merge
+
+Not every refactor benefits. Refactors that change a single module's internals, refactors where the new design is still being negotiated, and refactors whose risk is concentrated in one risky step are all better served by a single agent with a tight feedback loop. The split-merge pattern shines when the change is mechanical, when the slices are structurally identical, and when the trunk suite is fast enough to gate each merge independently.
+
+A useful heuristic: if you can write the slice briefs in advance without reading more code, the refactor is a good candidate. If writing the slice briefs requires understanding code you haven't yet read, do that reading first, possibly with a single agent producing the slice briefs as its deliverable.
+
+## Wrapping up
+
+Parallelism in coding agents isn't magic, and split-merge isn't a slogan to chant at every refactor. It's a specific protocol with specific prerequisites: a clear slice boundary, an isolated working copy per agent, a written contract between slices, a fast trunk test suite, and a merge order that respects dependencies. When those prerequisites hold, Claude Code makes the protocol cheap enough to be worth running. When they don't, the linear single-agent approach is still the right default.
+
+The useful next step, if this pattern is new to your team, is to run it once on a refactor you would have done linearly anyway. Time both the parallel phase and the merge phase. Compare the wallclock against your linear baseline. Notice which prerequisites you had to invent on the fly. The second time you reach for split-merge, those prerequisites will already be in place, and the pattern will start paying compound interest.
